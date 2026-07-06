@@ -23,7 +23,10 @@ subprojects {
 // transitive dependency now requires 36. Force every Android library
 // subproject up to 36 so AAR-metadata checks pass.
 subprojects {
-    afterEvaluate {
+    // `evaluationDependsOn(":app")` above can force some subprojects to be
+    // evaluated before this block is applied to them, so guard against
+    // registering an afterEvaluate hook on an already-evaluated project.
+    val forceCompileSdk36: Project.() -> Unit = {
         extensions.findByName("android")?.let { ext ->
             val android = ext as com.android.build.gradle.BaseExtension
             if (android.compileSdkVersion?.substringAfter("-")?.toIntOrNull()
@@ -31,6 +34,11 @@ subprojects {
                 android.compileSdkVersion(36)
             }
         }
+    }
+    if (state.executed) {
+        forceCompileSdk36()
+    } else {
+        afterEvaluate { forceCompileSdk36() }
     }
 }
 

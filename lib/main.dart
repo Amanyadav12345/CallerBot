@@ -1,11 +1,15 @@
+import 'dart:io';
+
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 
 import 'models/call_target.dart';
 import 'services/campaign_runner.dart';
+import 'services/root_audio.dart';
 import 'services/telephony_service.dart';
 
 void main() {
@@ -43,9 +47,13 @@ class _HomeScreenState extends State<HomeScreen> {
   int _ringSeconds = 30;
   CampaignRunner? _runner;
 
+  final AudioPlayer _preview = AudioPlayer();
+  bool _previewing = false;
+
   @override
   void dispose() {
     _numbersController.dispose();
+    _preview.dispose();
     _runner?.dispose();
     super.dispose();
   }
@@ -55,14 +63,6 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!phone.isGranted) {
       _snack('Phone permission is required to place calls.');
       return false;
-    }
-    final isDialer = await TelephonyService.isDefaultDialer();
-    if (!isDialer) {
-      final granted = await TelephonyService.requestDefaultDialer();
-      if (!granted) {
-        _snack('CallerBot must be the default phone app to control calls.');
-        return false;
-      }
     }
     return true;
   }
@@ -76,6 +76,31 @@ class _HomeScreenState extends State<HomeScreen> {
     final result = await FilePicker.platform.pickFiles(type: FileType.audio);
     if (result != null && result.files.single.path != null) {
       setState(() => _audioPath = result.files.single.path);
+    }
+  }
+
+  /// Plays the currently-selected message through the phone locally so the user
+  /// can confirm the file is valid and audible before starting a campaign.
+  Future<void> _previewMessage() async {
+    if (_previewing) {
+      await _preview.stop();
+      setState(() => _previewing = false);
+      return;
+    }
+    if (_audioPath != null && !await File(_audioPath!).exists()) {
+      _snack('That audio file no longer exists — pick it again.');
+      return;
+    }
+    try {
+      _preview.onPlayerComplete.first.then((_) {
+        if (mounted) setState(() => _previewing = false);
+      });
+      // Reset to a clean state first so a previously-wedged player can't fail.
+      await _preview.release();
+      await _preview.play(_buildSource());
+      setState(() => _previewing = true);
+    } catch (e) {
+      _snack('Could not play this message: $e');
     }
   }
 
@@ -106,10 +131,77 @@ class _HomeScreenState extends State<HomeScreen> {
         .showSnackBar(SnackBar(content: Text(msg)));
   }
 
+  Future<void> _runRootDiagnostics() async {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const AlertDialog(
+        content: Row(
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(width: 16),
+            Expanded(child: Text('Running root probe…\nApprove the Magisk prompt.')),
+          ],
+        ),
+      ),
+    );
+
+    RootResult result;
+    try {
+      result = await RootAudio.diagnostics();
+    } catch (e) {
+      result = RootResult(-1, 'Failed to run: $e');
+    }
+    if (!mounted) return;
+    Navigator.of(context).pop(); // dismiss the spinner
+
+    final text = result.output.trim().isEmpty
+        ? 'No output (exit ${result.exitCode}). Root (su) may have been denied.'
+        : result.output;
+
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Root audio diagnostics'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: SelectableText(
+              text,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: text));
+              if (mounted) _snack('Copied — paste it back to share.');
+            },
+            child: const Text('Copy'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('CallerBot')),
+      appBar: AppBar(
+        title: const Text('CallerBot'),
+        actions: [
+          IconButton(
+            tooltip: 'Root audio diagnostics',
+            icon: const Icon(Icons.bug_report),
+            onPressed: _runRootDiagnostics,
+          ),
+        ],
+      ),
       body: _runner == null ? _buildSetup() : _buildRunning(_runner!),
     );
   }
@@ -141,11 +233,21 @@ class _HomeScreenState extends State<HomeScreen> {
               leading: const Icon(Icons.audiotrack),
               title: Text(_audioPath == null
                   ? 'Bundled message (assets/audio/message.mp3)'
-                  : _audioPath!.split('/').last),
-              subtitle: const Text('Voice message to play when answered'),
-              trailing: TextButton(
-                onPressed: _pickAudio,
-                child: const Text('Choose'),
+                  : _audioPath!.split(RegExp(r'[\\/]')).last),
+              subtitle: const Text('Message played on the call (tap ▶ to test)'),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    tooltip: _previewing ? 'Stop' : 'Preview',
+                    icon: Icon(_previewing ? Icons.stop : Icons.play_arrow),
+                    onPressed: _previewMessage,
+                  ),
+                  TextButton(
+                    onPressed: _pickAudio,
+                    child: const Text('Choose'),
+                  ),
+                ],
               ),
             ),
           ),
